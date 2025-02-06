@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+	http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,32 +18,31 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
 	"encoding/json"
 	goerrors "errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
-	"github.com/kserve/kserve/pkg/constants"
 	"github.com/pkg/errors"
-
+	flag "github.com/spf13/pflag"
 	"github.com/tidwall/gjson"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	"crypto/rand"
-	"math/big"
-
 	"github.com/kserve/kserve/pkg/apis/serving/v1alpha1"
-	flag "github.com/spf13/pflag"
+	"github.com/kserve/kserve/pkg/constants"
 )
-
-var log = logf.Log.WithName("InferenceGraphRouter")
 
 func callService(serviceUrl string, input []byte, headers http.Header) ([]byte, int, error) {
 	defer timeTrack(time.Now(), "step", serviceUrl)
@@ -72,7 +71,16 @@ func callService(serviceUrl string, input []byte, headers http.Header) ([]byte, 
 	if val := req.Header.Get("Content-Type"); val == "" {
 		req.Header.Add("Content-Type", "application/json")
 	}
-	resp, err := http.DefaultClient.Do(req)
+
+	var client *http.Client
+	if routerTimeouts.ServiceClient == nil {
+		client = http.DefaultClient
+	} else {
+		client = &http.Client{
+			Timeout: time.Duration(*routerTimeouts.ServiceClient) * time.Second,
+		}
+	}
+	resp, err := client.Do(req)
 
 	if err != nil {
 		log.Error(err, "An error has occurred while calling service", "service", serviceUrl)
@@ -299,8 +307,6 @@ func prepareErrorResponse(err error, errorMessage string) []byte {
 	return errorResponseBytes
 }
 
-var inferenceGraph *v1alpha1.InferenceGraphSpec
-
 func graphHandler(w http.ResponseWriter, req *http.Request) {
 	inputBytes, _ := io.ReadAll(req.Body)
 	if response, statusCode, err := routeStep(v1alpha1.GraphRootNodeName, *inferenceGraph, inputBytes, req.Header); err != nil {
@@ -335,9 +341,35 @@ func compilePatterns(patterns []string) ([]*regexp.Regexp, error) {
 	return compiled, goerrors.Join(allErrors...)
 }
 
+func getTimeout(value, defaultValue *int64) *int64 {
+	if value != nil {
+		return value
+	}
+	return defaultValue
+}
+
+func initTimeouts(graph v1alpha1.InferenceGraphSpec) {
+	defaultServerRead := int64(constants.RouterTimeoutsServerRead)
+	defaultServerWrite := int64(constants.RouterTimeoutServerWrite)
+	defaultServerIdle := int64(constants.RouterTimeoutServerIdle)
+
+	routerTimeouts = &v1alpha1.InfereceGraphRouterTimeouts{
+		ServerRead:    getTimeout(graph.RouterTimeouts.ServerRead, &defaultServerRead),
+		ServerWrite:   getTimeout(graph.RouterTimeouts.ServerWrite, &defaultServerWrite),
+		ServerIdle:    getTimeout(graph.RouterTimeouts.ServerIdle, &defaultServerIdle),
+		ServiceClient: getTimeout(graph.RouterTimeouts.ServiceClient, nil),
+	}
+}
+
 var (
-	jsonGraph              = flag.String("graph-json", "", "serialized json graph def")
+	jsonGraph                                           = flag.String("graph-json", "", "serialized json graph def")
+	inferenceGraph         *v1alpha1.InferenceGraphSpec = nil
 	compiledHeaderPatterns []*regexp.Regexp
+	isShuttingDown                                               = false
+	drainSleepDuration                                           = 30 * time.Second
+	routerTimeouts         *v1alpha1.InfereceGraphRouterTimeouts = nil
+	log                                                          = logf.Log.WithName("InferenceGraphRouter")
+	signalChan                                                   = make(chan os.Signal, 1)
 )
 
 func main() {
@@ -352,26 +384,52 @@ func main() {
 			log.Error(err, "Failed to compile some header patterns")
 		}
 	}
+
 	inferenceGraph = &v1alpha1.InferenceGraphSpec{}
 	err := json.Unmarshal([]byte(*jsonGraph), inferenceGraph)
 	if err != nil {
 		log.Error(err, "failed to unmarshall inference graph json")
 		os.Exit(1)
 	}
+	initTimeouts(*inferenceGraph)
 
 	http.HandleFunc("/", graphHandler)
 
 	server := &http.Server{
-		Addr:         ":8080",                        // specify the address and port
-		Handler:      http.HandlerFunc(graphHandler), // specify your HTTP handler
-		ReadTimeout:  time.Minute,                    // set the maximum duration for reading the entire request, including the body
-		WriteTimeout: time.Minute,                    // set the maximum duration before timing out writes of the response
-		IdleTimeout:  3 * time.Minute,                // set the maximum amount of time to wait for the next request when keep-alives are enabled
+		Addr:        ":8080",
+		Handler:      nil,                                                      // default server mux
+		ReadTimeout:  time.Duration(*routerTimeouts.ServerRead) * time.Second,  // set the maximum duration for reading the entire request, including the body
+		WriteTimeout: time.Duration(*routerTimeouts.ServerWrite) * time.Second, // set the maximum duration before timing out writes of the response
+		IdleTimeout:  time.Duration(*routerTimeouts.ServerIdle) * time.Second,  // set the maximum amount of time to wait for the next request when keep-alives are enabled
 	}
-	err = server.ListenAndServe()
 
-	if err != nil {
-		log.Error(err, "failed to listen on 8080")
+	go func() {
+		err = server.ListenAndServe()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error(err, fmt.Sprintf("Failed to serve on address %v", server.Addr))
+			os.Exit(1)
+		}
+	}()
+
+	// Blocks until SIGTERM or SIGINT is received
+	handleSignals(server)
+}
+
+func handleSignals(server *http.Server) {
+	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
+
+	sig := <-signalChan
+	log.Info("Received shutdown signal", "signal", sig)
+	// Fail the readiness probe
+	isShuttingDown = true
+	log.Info("Sleeping %v to allow K8s propagation of non-ready state", drainSleepDuration)
+	// Sleep to give networking a little bit more time to remove the pod
+	// from its configuration and propagate that to all loadbalancers and nodes.
+	time.Sleep(drainSleepDuration)
+	// Shut down the server gracefully
+	if err := server.Shutdown(context.Background()); err != nil {
+		log.Error(err, "Failed to shutdown the server gracefully")
 		os.Exit(1)
 	}
+	log.Info("Server gracefully shutdown")
 }

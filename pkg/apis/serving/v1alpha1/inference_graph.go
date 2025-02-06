@@ -53,6 +53,8 @@ type InferenceGraphSpec struct {
 	// TimeoutSeconds specifies the number of seconds to wait before timing out a request to the component.
 	// +optional
 	TimeoutSeconds *int64 `json:"timeout,omitempty"`
+	// +optional
+	RouterTimeouts *InfereceGraphRouterTimeouts `json:"routerTimeouts,omitempty"`
 	// Minimum number of replicas, defaults to 1 but can be set to 0 to enable scale-to-zero.
 	// +optional
 	MinReplicas *int `json:"minReplicas,omitempty"`
@@ -99,6 +101,22 @@ const (
 	// GraphRootNodeName is the root node name.
 	GraphRootNodeName string = "root"
 )
+
+// +k8s:openapi-gen=true
+type InfereceGraphRouterTimeouts struct {
+	// ServerRead specifies the number of seconds to wait before timing out a request read by the server.
+	// +optional
+	ServerRead *int64 `json:"serverRead,omitempty"`
+	// ServerWrite specifies the maximum duration in seconds before timing out writes of the response.
+	// +optional
+	ServerWrite *int64 `json:"serverWrite,omitempty"`
+	// ServerIdle specifies the maximum amount of time in seconds to wait for the next request when keep-alives are enabled.
+	// +optional
+	ServerIdle *int64 `json:"serverIdle,omitempty"`
+	// ServiceClient specifies a time limit in seconds for requests made to the graph components by HTTP client.
+	// +optional
+	ServiceClient *int64 `json:"serviceClient,omitempty"`
+}
 
 // +k8s:openapi-gen=true
 // InferenceRouter defines the router for each InferenceGraph node with one or multiple steps
