@@ -353,12 +353,20 @@ func initTimeouts(graph v1alpha1.InferenceGraphSpec) {
 	defaultServerWrite := int64(constants.RouterTimeoutServerWrite)
 	defaultServerIdle := int64(constants.RouterTimeoutServerIdle)
 
-	routerTimeouts = &v1alpha1.InfereceGraphRouterTimeouts{
-		ServerRead:    getTimeout(graph.RouterTimeouts.ServerRead, &defaultServerRead),
-		ServerWrite:   getTimeout(graph.RouterTimeouts.ServerWrite, &defaultServerWrite),
-		ServerIdle:    getTimeout(graph.RouterTimeouts.ServerIdle, &defaultServerIdle),
-		ServiceClient: getTimeout(graph.RouterTimeouts.ServiceClient, nil),
+	timeouts := &v1alpha1.InfereceGraphRouterTimeouts{
+		ServerRead:    &defaultServerRead,
+		ServerWrite:   &defaultServerWrite,
+		ServerIdle:    &defaultServerIdle,
 	}
+
+	if graph.RouterTimeouts != nil {
+		timeouts.ServerRead = getTimeout(graph.RouterTimeouts.ServerRead, &defaultServerRead)
+		timeouts.ServerWrite = getTimeout(graph.RouterTimeouts.ServerWrite, &defaultServerWrite)
+		timeouts.ServerIdle = getTimeout(graph.RouterTimeouts.ServerIdle, &defaultServerIdle)
+		timeouts.ServiceClient = getTimeout(graph.RouterTimeouts.ServiceClient, nil)
+	}
+
+	routerTimeouts = timeouts
 }
 
 var (
